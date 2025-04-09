@@ -1,9 +1,12 @@
 # tools.py
+from langchain_core.messages import ToolMessage
 from langchain_core.tools import tool, StructuredTool
 from typing import Annotated, List
 import re
 from app.core.logging import logger
-from app.tools.MjLogs.mj_log_query_tool import query_logs_and_get_results
+from app.tools.ActivityTool.activity_tool import analyze_ticket_subject
+from app.tools.MjLogs.mj_log_query_tool import query_logs_and_get_results, query_system_logs
+from app.tools.PointsDetails.query_points_details import query_points_details
 from app.tools.sql_db_query_tool import SQLQueryTool
 
 
@@ -12,33 +15,12 @@ class Tools:
 
     @staticmethod
     @tool
-    def query_mj_logs(params: Annotated[str, "查询前端日志的HTTP接口参数"]) -> str:
-        """从前端日志API接口中获取相关日志信息。"""
-        try:
-            logger.info(f"开始查询前端日志，参数：{params}")
-            return f"前端日志查询成功，参数：{params}"
-        except Exception as e:
-            logger.error(f"前端日志查询失败：{str(e)}")
-            return f"前端日志查询失败：{str(e)}"
-
-    @staticmethod
-    @tool
-    def query_sso_db_info(user_id: Annotated[str, "用户ID"]) -> str:
-        """从数据库查询用户信息。"""
-        try:
-            logger.info(f"开始查询用户信息，用户ID：{user_id}")
-            return f"用户 {user_id} 的信息已成功查询。"
-        except Exception as e:
-            logger.error(f"用户信息查询失败：{str(e)}")
-            return f"用户信息查询失败：{str(e)}"
-
-    @staticmethod
-    @tool
     def query_ones_rag(ticket_id: Annotated[str, "工单ID"]) -> str:
         """获取ONES工单背景信息。"""
         try:
             logger.info(f"开始查询工单背景信息，工单ID：{ticket_id}")
-            return f"工单 {ticket_id} 的背景信息已获取。"
+            return f"该工具无法使用，请使用其他工具。"
+            # return f"工单 {ticket_id} 的背景信息已获取。"
         except Exception as e:
             logger.error(f"工单背景信息查询失败：{str(e)}")
             return f"工单背景信息查询失败：{str(e)}"
@@ -104,8 +86,8 @@ class Tools:
     def query_ticket_background(ticket_id: Annotated[str, "工单ID"]) -> str:
         """从ones平台，获取工单的背景信息。"""
         try:
-            logger.info(f"开始查询工单背景信息，工单ID：{ticket_id}")
-            return f"抱歉，当前该工具不支持工单查询。"
+            logger.info(f"抱歉，当前该工具不支持工单查询，请使用其他工具")
+            return f"抱歉，当前该工具不支持工单查询，请使用其他工具。"
         except Exception as e:
             logger.error(f"工单背景信息查询失败：{str(e)}")
             return f"工单背景信息查询失败：{str(e)}"
@@ -120,4 +102,6 @@ class Tools:
             cls.query_system_logs,
             cls.query_user_info,
             cls.query_ticket_background,
+            query_points_details,
+            analyze_ticket_subject
         ]

@@ -1,6 +1,7 @@
+import functools
 import uuid
 from time import time
-from typing import Dict, Any, Generator, List, TypedDict
+from typing import Dict, Any, Generator, List, TypedDict, Literal
 import re
 
 from langchain_openai import ChatOpenAI
@@ -36,6 +37,21 @@ class TicketWorkflowService:
         self.tools = Tools.get_all_tools()
         self.graph = self.create_ticket_workflow()
 
+    @staticmethod
+    def agent_node(state, agent, name):
+        """
+        调用指定的代理，并处理其返回的消息。
+        """
+        result = agent.invoke(state)
+        if isinstance(result, ToolMessage):
+            pass
+        else:
+            result = AIMessage(**result.model_dump(exclude={"type", "name"}), name=name)
+        return {
+            "messages": [result],
+            "sender": name,
+        }
+
     def _create_agent(self, system_message: str):
         """创建代理"""
         prompt = ChatPromptTemplate.from_messages([
@@ -63,41 +79,28 @@ class TicketWorkflowService:
         resolution_agent = self._create_agent(
             "结合工单问题和工具返回的信息，分析问题原因并提供解决方案。"
         )
-
+        analysis_node = functools.partial(self.agent_node, agent=analysis_agent, name="analysis_agent")
+        resolution_node = functools.partial(self.agent_node, agent=resolution_agent, name="resolution_agent")
         # 创建工作流图
         workflow = StateGraph(state_schema=WorkflowState)
 
         # 添加节点
-        workflow.add_node("analysis_agent", analysis_agent)
-        workflow.add_node("resolution_agent", resolution_agent)
+        workflow.add_node("analysis_agent", analysis_node)
+        workflow.add_node("resolution_agent", resolution_node)
         workflow.add_node("call_tool", self._tool_node_with_context)
 
         # 添加边
         workflow.add_conditional_edges(
             "analysis_agent",
-            self._router,
-            {
-                "call_tool": "call_tool",
-                "resolution_agent": "resolution_agent",
-                "__end__": END
-            }
+            self._router, {"call_tool": "call_tool", "resolution_agent": "resolution_agent", "__end__": END}
         )
         workflow.add_conditional_edges(
             "resolution_agent",
-            self._router,
-            {
-                "call_tool": "call_tool",
-                "resolution_agent": "resolution_agent",
-                "__end__": END
-            }
+            self._router, {"call_tool": "call_tool", "resolution_agent": "resolution_agent", "__end__": END}
         )
         workflow.add_conditional_edges(
             "call_tool",
-            lambda x: x["sender"],
-            {
-                "analysis_agent": "analysis_agent",
-                "resolution_agent": "resolution_agent"
-            }
+            lambda x: x["sender"], {"analysis_agent": "analysis_agent", "resolution_agent": "resolution_agent"}
         )
         workflow.add_edge(START, "analysis_agent")
 
@@ -106,7 +109,7 @@ class TicketWorkflowService:
     def _tool_node_with_context(self, state: Dict[str, Any]) -> Dict[str, Any]:
         """处理工具调用"""
         try:
-            logger.debug(f"Tool node state keys: {list(state.keys())}")
+            logger.debug(f"工具节点状态键值: {list(state.keys())}")
 
             # 为工具添加上下文
             for tool in self.tools:
@@ -115,30 +118,30 @@ class TicketWorkflowService:
             # 获取最后一条消息
             messages = state.get("messages", [])
             if not messages:
-                logger.warning("No messages found in state")
+                logger.warning("状态中未找到消息")
                 return state
-                
+
             last_message = messages[-1]
-            
+
             # 检查是否有工具调用
             if not hasattr(last_message, 'tool_calls') or not last_message.tool_calls:
-                logger.warning("No tool calls found in last message")
+                logger.warning("最后一条消息中未找到工具调用")
                 return state
-                
+
             # 执行工具调用
             tool_calls = last_message.tool_calls
             tool_results = []
-            
+
             for tool_call in tool_calls:
                 tool_name = tool_call.get("name")
-                tool_args = tool_call.get("arguments", {})
-                
+                tool_args = tool_call.get("args", {})
+
                 # 查找对应的工具
                 tool = next((t for t in self.tools if t.name == tool_name), None)
                 if not tool:
-                    logger.warning(f"Tool {tool_name} not found")
+                    logger.warning(f"未找到工具: {tool_name}")
                     continue
-                    
+
                 # 调用工具
                 try:
                     result = tool.invoke(tool_args)
@@ -147,26 +150,41 @@ class TicketWorkflowService:
                         "content": result
                     })
                 except Exception as e:
-                    logger.error(f"Error invoking tool {tool_name}: {str(e)}")
+                    logger.error(f"工具 {tool_name} 调用失败: {str(e)}")
                     tool_results.append({
                         "name": tool_name,
-                        "content": f"Error: {str(e)}"
+                        "content": f"错误: {str(e)}"
                     })
-            
+
             # 更新状态
             state["tool_results"] = tool_results
             return state
-            
+
         except Exception as e:
-            logger.error(f"Tool node error: {str(e)}")
+            logger.error(f"工具节点执行错误: {str(e)}")
             return state
 
-    def _router(self, state: Dict[str, Any]) -> str:
+    def _router(self, state: Dict[str, Any]) -> Literal["call_tool", "resolution_agent", "__end__"]:
         """路由决策"""
+        # 添加迭代计数
+        state["iteration_count"] = state.get("iteration_count", 0) + 1
         messages = state["messages"]
         last_message = messages[-1]
 
-        # 处理用户信息查询结果
+        # 检查终止条件
+        if state["iteration_count"] > 10:
+            logger.warning(f"【终止】工作流超过最大迭代次数: {state['iteration_count']}")
+            return "__end__"
+        
+        if len(messages) > 15:
+            logger.warning(f"【终止】工作流超过最大消息数: {len(messages)}")
+            return "__end__"
+        
+        if any("FINAL ANSWER" in str(getattr(m, 'content', '')) for m in messages):
+            logger.info("【完成】工作流获得最终答案，正常结束")
+            return "__end__"
+
+        # 处理用户信息
         if isinstance(last_message, ToolMessage) and last_message.name == "query_user_info":
             try:
                 user_id_match = re.search(r'\(\s*(\d+)\s*,', last_message.content)
@@ -174,24 +192,20 @@ class TicketWorkflowService:
                     if "context" not in state:
                         state["context"] = {}
                     state["context"]["user_id"] = user_id_match.group(1)
-                    logger.debug(f"Extracted user ID: {state['context']['user_id']}")
+                    logger.debug(f"【用户】成功提取用户ID: {state['context']['user_id']}")
             except Exception as e:
-                logger.error(f"Failed to extract user ID: {str(e)}")
-
-        # 处理次数保护
-        if len(messages) > 10:
-            logger.warning("Maximum message limit reached")
-            return "__end__"
+                logger.error(f"【错误】提取用户ID失败: {str(e)}")
 
         # 路由决策
         if hasattr(last_message, 'tool_calls') and last_message.tool_calls:
-            logger.debug(f"Found tool calls in message: {last_message.tool_calls}")
+            logger.debug(f"【路由】发现工具调用，转向工具节点: {last_message.tool_calls}")
             return "call_tool"
+        
         if hasattr(last_message, 'content') and "FINAL ANSWER" in last_message.content:
-            logger.debug("Found FINAL ANSWER in message")
+            logger.debug("【路由】发现最终答案标记，工作流结束")
             return "__end__"
-            
-        logger.debug(f"Routing to resolution_agent, message type: {type(last_message).__name__}")
+
+        logger.debug(f"【路由】转向解决方案代理，消息类型: {type(last_message).__name__}")
         return "resolution_agent"
 
     async def process_ticket(self, ticket: TicketRequest) -> TicketResponse:
@@ -208,12 +222,12 @@ class TicketWorkflowService:
         start_time = time()
 
         try:
-            logger.info(f"Processing ticket {request_id}")
-            logger.debug(f"Ticket content: {ticket.format_ticket_content()}")
+            logger.info(f"【开始】处理工单 {request_id}")
+            logger.debug(f"【工单】内容: {ticket.format_ticket_content()}")
 
             # 运行工作流
             events = []
-            logger.debug("Starting workflow execution")
+            logger.debug("【工作流】开始执行")
             for event in self.graph.stream({
                 "messages": [
                     HumanMessage(content=ticket.format_ticket_content())
@@ -221,12 +235,12 @@ class TicketWorkflowService:
                 "context": {
                     "request_id": request_id
                 }
-            }):
-                logger.debug(f"Workflow event: {event.get('sender', 'unknown')} - {type(event).__name__}")
+            }, {"recursion_limit": 20}):
+                logger.debug(f"【事件】{event.get('sender', 'unknown')} - {type(event).__name__}")
                 events.append(event)
 
             # 提取结果
-            logger.debug(f"Processing {len(events)} events")
+            logger.debug(f"【处理】共 {len(events)} 个事件")
             analysis = ""
             solution = ""
             messages = []
@@ -235,10 +249,10 @@ class TicketWorkflowService:
                 if isinstance(event.get("messages", [None])[0], AIMessage):
                     msg_content = event["messages"][0].content
                     if "FINAL ANSWER" in msg_content:
-                        logger.debug("Found final answer")
+                        logger.debug("【结果】找到最终答案")
                         solution = msg_content.replace("FINAL ANSWER", "").strip()
                     elif event.get("sender") == "analysis_agent":
-                        logger.debug("Found analysis")
+                        logger.debug("【结果】找到分析内容")
                         analysis = msg_content
                     messages.append({
                         "role": event["sender"],
@@ -246,7 +260,7 @@ class TicketWorkflowService:
                     })
 
             processing_time = time() - start_time
-            logger.debug(f"Processing completed in {processing_time:.2f}s")
+            logger.debug(f"【完成】处理耗时: {processing_time:.2f}秒")
 
             # 构建响应
             response = TicketResponse(
@@ -258,9 +272,9 @@ class TicketWorkflowService:
                 processing_time=processing_time
             )
 
-            logger.info(f"Completed ticket {request_id} in {processing_time:.2f}s")
+            logger.info(f"【完成】工单 {request_id} 处理完成，耗时: {processing_time:.2f}秒")
             return response
 
         except Exception as e:
-            log_exception(logger, e, f"Error processing ticket {request_id}")
+            log_exception(logger, e, f"【错误】处理工单 {request_id} 失败")
             raise
